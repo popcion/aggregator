@@ -28,7 +28,7 @@ env:
 
 jobs:
   process:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -65,7 +65,7 @@ jobs:
           fi
 
       - name: Collect
-        run: python -u subscribe/collect.py --all --both --overwrite 
+        run: python -u subscribe/collect.py --all --both --overwrite --delay 1500 --flow 5 --chunk --easygoing
 
       - name: Timestamp
         run: date
