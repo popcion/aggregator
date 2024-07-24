@@ -65,7 +65,7 @@ jobs:
           fi
 
       - name: Refresh
-        run: python -u subscribe/collect.py --all --both --refresh --overwrite --delay 1500 --flow 5 --chunk --easygoing
+        run: python -u subscribe/collect.py --all --both --refresh --overwrite --delay 1500 --flow 5 --easygoing
 
       - name: Timestamp
         run: date
