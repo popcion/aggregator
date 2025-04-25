@@ -1,333 +1,641 @@
-# -*- coding: utf-8 -*-
-
-# @Author  : wzdnzd
-# @Time    : 2024-07-09
-
-
-import argparse
-import gzip
-import json
-import math
+import io
 import os
-import random
+import sys
 import re
-import socket
-import ssl
-import string
-import typing
-import urllib
-import urllib.request
-from collections import defaultdict
-from http.client import HTTPResponse
+import shutil
+import mimetypes
+import time
+import asyncio
+import subprocess
+import secrets
+from io import BytesIO
+from PIL import Image
+from aiohttp import web
+from collections import deque
+from imagehash import phash
+from manga_translator import MangaTranslator
 
-import yaml
-from geoip2 import database
+### --- concurrency patch (1) ---
+# 默认并发协程数，可用环境变量 MT_CONCURRENCY 覆盖
+CONCURRENCY = int(os.getenv("MT_CONCURRENCY", 4))
+### ------------------------------
 
-PATH = os.path.abspath(os.path.dirname(__file__))
+SERVER_DIR_PATH = os.path.dirname(os.path.realpath(__file__))
+BASE_PATH = os.path.dirname(os.path.dirname(SERVER_DIR_PATH))
 
-CTX = ssl.create_default_context()
-CTX.check_hostname = False
-CTX.verify_mode = ssl.CERT_NONE
+# TODO: Get capabilities through api
+VALID_LANGUAGES = {
+    'CHS': 'Chinese (Simplified)',
+    'CHT': 'Chinese (Traditional)',
+    'CSY': 'Czech',
+    'NLD': 'Dutch',
+    'ENG': 'English',
+    'FRA': 'French',
+    'DEU': 'German',
+    'HUN': 'Hungarian',
+    'ITA': 'Italian',
+    'JPN': 'Japanese',
+    'KOR': 'Korean',
+    'PLK': 'Polish',
+    'PTB': 'Portuguese (Brazil)',
+    'ROM': 'Romanian',
+    'RUS': 'Russian',
+    'ESP': 'Spanish',
+    'TRK': 'Turkish',
+    'UKR': 'Ukrainian',
+    'VIN': 'Vietnamese',
+    'ARA': 'Arabic',
+}
+# Whitelists
+VALID_DETECTORS = set(['default', 'ctd'])
+VALID_DIRECTIONS = set(['auto', 'h', 'v'])
+VALID_TRANSLATORS = [
+    'youdao',
+    'baidu',
+    'google',
+    'deepl',
+    'deepseek',
+    'papago',
+    'caiyun',
+    'gpt3.5',
+    'gpt4',
+    'nllb',
+    'nllb_big',
+    'sugoi',
+    'jparacrawl',
+    'jparacrawl_big',
+    'm2m100',
+    'm2m100_big',
+    'qwen2',
+    'qwen2_big',
+    'sakura',
+    'none',
+    'original',
+]
+
+### --- concurrency patch (1-b) ---
+MAX_ONGOING_TASKS = CONCURRENCY     # 原来为 1
+### -------------------------------
+MAX_IMAGE_SIZE_PX = 8000**2
+
+# Time to wait for web client to send a request to /task-state request
+# before that web clients task gets removed from the queue
+WEB_CLIENT_TIMEOUT = -1
+
+# Time before finished tasks get removed from memory
+FINISHED_TASK_REMOVE_TIMEOUT = 1800
+
+# Auto deletes old task folders upon reaching this disk space limit
+DISK_SPACE_LIMIT = 5e7 # 50mb
+
+# TODO: Turn into dict with translator client id as key for support of multiple translator clients
+ONGOING_TASKS = []
+FINISHED_TASKS = []
+NONCE = ''
+QUEUE = deque()
+TASK_DATA = {}
+TASK_STATES = {}
+DEFAULT_TRANSLATION_PARAMS = {}
+AVAILABLE_TRANSLATORS = []
+FORMAT = ''
+
+app = web.Application(client_max_size = 1024 * 1024 * 50)
+routes = web.RouteTableDef()
 
 
-def trim(text: str) -> str:
-    if not text or type(text) != str:
-        return ""
+def constant_compare(a, b):
+    if isinstance(a, str):
+        a = a.encode('utf-8')
+    if isinstance(b, str):
+        b = b.encode('utf-8')
+    if not isinstance(a, bytes) or not isinstance(b, bytes):
+        return False
+    if len(a) != len(b):
+        return False
 
-    return text.strip()
+    result = 0
+    for x, y in zip(a, b):
+        result |= x ^ y
+    return result == 0
 
+@routes.get("/")
+async def index_async(request):
+    global AVAILABLE_TRANSLATORS
+    with open(os.path.join(SERVER_DIR_PATH, 'ui.html'), 'r', encoding='utf8') as fp:
+        content = fp.read()
+        if AVAILABLE_TRANSLATORS:
+            content = re.sub(r'(?<=translator: )(.*)(?=,)', repr(AVAILABLE_TRANSLATORS[0]), content)
+            content = re.sub(r'(?<=validTranslators: )(\[.*\])(?=,)', repr(AVAILABLE_TRANSLATORS), content)
+        return web.Response(text=content, content_type='text/html')
 
-def copy(filepath: str) -> None:
-    if not filepath or not os.path.exists(filepath) or not os.path.isfile(filepath):
-        return
+@routes.get("/manual")
+async def index_async(request):
+    with open(os.path.join(SERVER_DIR_PATH, 'manual.html'), 'r', encoding='utf8') as fp:
+        return web.Response(text=fp.read(), content_type='text/html')
 
-    newfile = f"{filepath}.bak"
-    if os.path.exists(newfile):
-        os.remove(newfile)
+@routes.get("/result/{taskid}")
+async def result_async(request):
+    global FORMAT
+    filepath = os.path.join('result', request.match_info.get('taskid'), f'final.{FORMAT}')
+    if not os.path.exists(filepath):
+        return web.Response(status=404, text='Not Found')
+    stream = BytesIO()
+    with open(filepath, 'rb') as f:
+        stream.write(f.read())
+    mime = mimetypes.guess_type(filepath)[0] or 'application/octet-stream'
+    return web.Response(body=stream.getvalue(), content_type=mime)
 
-    os.rename(filepath, newfile)
+@routes.get("/result-type")
+async def file_type_async(request):
+    global FORMAT
+    return web.Response(text=f'{FORMAT}')
 
+@routes.get("/queue-size")
+async def queue_size_async(request):
+    return web.json_response({'size' : len(QUEUE)})
 
-def download_mmdb(repo: str, target: str, filepath: str, retry: int = 3):
-    """
-    Download GeoLite2-City.mmdb from github release
-    """
-    repo = trim(text=repo)
-    if not repo or len(repo.split("/", maxsplit=1)) != 2:
-        raise ValueError(f"invalid github repo name: {repo}")
-
-    target = trim(target)
-    if not target:
-        raise ValueError("invalid download target")
-
-    # extract download url from github release page
-    release_api = f"https://api.github.com/repos/{repo}/releases/latest?per_page=1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
-    }
-
-    count, response = 0, None
-    while count < retry and response is None:
-        try:
-            request = urllib.request.Request(url=release_api, headers=headers)
-            response = urllib.request.urlopen(request, timeout=10, context=CTX)
-        except Exception:
-            count += 1
-
-    assets = read_response(response=response, expected=200, deserialize=True, key="assets")
-    if not assets or not isinstance(assets, list):
-        raise Exception("no assets found in github release")
-
-    download_url = ""
-    for asset in assets:
-        if asset.get("name", "") == target:
-            download_url = asset.get("browser_download_url", "")
-            break
-
-    if not download_url:
-        raise Exception("no download url found in github release")
-
-    download(download_url, filepath, target, retry)
-
-
-def download(url: str, filepath: str, filename: str, retry: int = 3) -> None:
-    """Download file from url to filepath with filename"""
-
-    if retry < 0:
-        raise Exception("archieved max retry count for download")
-
-    url = trim(url)
-    if not url:
-        raise ValueError("invalid download url")
-
-    filepath = trim(filepath)
-    if not filepath:
-        raise ValueError("invalid save filepath")
-
-    filename = trim(filename)
-    if not filename:
-        raise ValueError("invalid save filename")
-
-    if not os.path.exists(filepath) or not os.path.isdir(filepath):
-        os.makedirs(filepath)
-
-    fullpath = os.path.join(filepath, filename)
-    if os.path.exists(fullpath) and os.path.isfile(fullpath):
-        os.remove(fullpath)
-
-    # download target file from github release to fullpath
+async def handle_post(request):
+    data = await request.post()
+    detection_size = None
+    selected_translator = 'youdao'
+    target_language = 'CHS'
+    detector = 'default'
+    direction = 'auto'
+    if 'target_lang' in data:
+        target_language = data['target_lang'].upper()
+        # TODO: move dicts to their own files to reduce load time
+        if target_language not in VALID_LANGUAGES:
+            target_language = 'CHS'
+    if 'detector' in data:
+        detector = data['detector'].lower()
+        if detector not in VALID_DETECTORS:
+            detector = 'default'
+    if 'direction' in data:
+        direction = data['direction'].lower()
+        if direction not in VALID_DIRECTIONS:
+            direction = 'auto'
+    if 'translator' in data:
+        selected_translator = data['translator'].lower()
+        if selected_translator not in AVAILABLE_TRANSLATORS:
+            selected_translator = AVAILABLE_TRANSLATORS[0]
+    if 'size' in data:
+        size_text = data['size'].upper()
+        if size_text == 'S':
+            detection_size = 1024
+        elif size_text == 'M':
+            detection_size = 1536
+        elif size_text == 'L':
+            detection_size = 2048
+        elif size_text == 'X':
+            detection_size = 2560
+    if 'file' in data:
+        file_field = data['file']
+        content = file_field.file.read()
+    elif 'url' in data:
+        from aiohttp import ClientSession
+        async with ClientSession() as session:
+            async with session.get(data['url']) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                else:
+                    return web.json_response({'status': 'error'})
+    else:
+        return web.json_response({'status': 'error'})
     try:
-        urllib.request.urlretrieve(url=url, filename=fullpath)
+        img = Image.open(io.BytesIO(content))
+        img.verify()
+        img = Image.open(io.BytesIO(content))
+        if img.width * img.height > MAX_IMAGE_SIZE_PX:
+            return web.json_response({'status': 'error-too-large'})
     except Exception:
-        return download(url, filepath, filename, retry - 1)
+        return web.json_response({'status': 'error-img-corrupt'})
+    return img, detection_size, selected_translator, target_language, detector, direction
 
-    print(f"download file {filename} to {fullpath} success")
+@routes.post("/run")
+async def run_async(request):
+    global FORMAT
+    x = await handle_post(request)
+    if isinstance(x, tuple):
+        img, size, selected_translator, target_language, detector, direction = x
+    else:
+        return x
+    timestamp = str(int(time.time() * 1000))  # 使用时间戳
+    task_id = f'{size}-{selected_translator}-{target_language}-{detector}-{direction}-{timestamp}-{phash(img, hash_size = 16)}'
+    print(f'New `run` task {task_id}')
+    if os.path.exists(f'result/{task_id}/final.{FORMAT}'):
+        # Add a console output prompt to avoid the console from appearing to be stuck without execution when the translated image is hit consecutively.
+        print(f'Using cached result for {task_id}')
+        return web.json_response({'task_id' : task_id, 'status': 'successful'})
+    # elif os.path.exists(f'result/{task_id}'):
+    #     # either image is being processed or error occurred
+    #     if task_id not in TASK_STATES:
+    #         # error occurred
+    #         return web.json_response({'state': 'error'})
+    else:
+        os.makedirs(f'result/{task_id}/', exist_ok=True)
+        img.save(f'result/{task_id}/input.png')
+        QUEUE.append(task_id)
+        now = time.time()
+        TASK_DATA[task_id] = {
+            'detection_size': size,
+            'translator': selected_translator,
+            'target_lang': target_language,
+            'detector': detector,
+            'direction': direction,
+            'created_at': now,
+            'requested_at': now,
+        }
+        TASK_STATES[task_id] = {
+            'info': 'pending',
+            'finished': False,
+        }
+    while True:
+        await asyncio.sleep(0.1)
+        if task_id not in TASK_STATES:
+            break
+        state = TASK_STATES[task_id]
+        if state['finished']:
+            break
+    return web.json_response({'task_id': task_id, 'status': 'successful' if state['finished'] else state['info']})
 
 
-def load_mmdb(
-    directory: str, repo: str = "alecthw/mmdb_china_ip_list", filename: str = "Country.mmdb", update: bool = False
-) -> database.Reader:
-    filepath = os.path.join(directory, filename)
-    if update or not os.path.exists(filepath) or not os.path.isfile(filepath):
-        if not download_mmdb(repo, filename, directory):
-            return None
+@routes.post("/connect-internal")
+async def index_async(request):
+    global NONCE, VALID_TRANSLATORS, AVAILABLE_TRANSLATORS
+    # Can be extended to allow support for multiple translators
+    rqjson = await request.json()
+    if constant_compare(rqjson.get('nonce'), NONCE):
+        capabilities = rqjson.get('capabilities')
+        if capabilities:
+            translators = capabilities.get('translators')
+            AVAILABLE_TRANSLATORS.clear()
+            for key in VALID_TRANSLATORS:
+                if key in translators:
+                    AVAILABLE_TRANSLATORS.append(key)
+    return web.json_response({})
 
-    return database.Reader(filepath)
-
-
-def read_response(response: HTTPResponse, expected: int = 200, deserialize: bool = False, key: str = "") -> typing.Any:
-    if not response or not isinstance(response, HTTPResponse):
-        return None
-
-    success = expected <= 0 or expected == response.getcode()
-    if not success:
-        return None
-
-    try:
-        text = response.read()
-    except:
-        text = b""
-
-    try:
-        content = text.decode(encoding="UTF8")
-    except UnicodeDecodeError:
-        content = gzip.decompress(text).decode("UTF8")
-    except:
-        content = ""
-
-    if not deserialize:
-        return content
-
-    if not content:
-        return None
-    try:
-        data = json.loads(content)
-        return data if not key else data.get(key, None)
-    except:
-        return None
-
-
-def main(args: argparse.Namespace) -> None:
-    filepath = os.path.abspath(trim(args.config))
-    if not os.path.exists(filepath) or not os.path.isfile(filepath):
-        print(f"file {filepath} not exists")
-        return
-
-    caches = defaultdict(list)
-    with open(filepath, "r", encoding="utf8") as f:
-        try:
-            nodes = yaml.load(f, Loader=yaml.SafeLoader).get("proxies", [])
-        except yaml.constructor.ConstructorError:
-            f.seek(0, 0)
-            yaml.add_multi_constructor("str", lambda loader, suffix, node: str(node.value), Loader=yaml.SafeLoader)
-            nodes = yaml.load(f, Loader=yaml.SafeLoader).get("proxies", [])
-        except:
-            nodes = []
-
-        if nodes and args.location:
-            workspace = os.path.abspath(trim(args.workspace) or PATH)
-            reader = load_mmdb(directory=workspace, update=args.update)
+@routes.get("/task-internal")
+async def get_task_async(request):
+    """
+    Called by the translator to get a translation task.
+    """
+    global NONCE, ONGOING_TASKS, DEFAULT_TRANSLATION_PARAMS
+    if constant_compare(request.rel_url.query.get('nonce'), NONCE):
+        if len(QUEUE) > 0 and len(ONGOING_TASKS) < MAX_ONGOING_TASKS:
+            task_id = QUEUE.popleft()
+            if task_id in TASK_DATA:
+                data = TASK_DATA[task_id]
+                for p, default_value in DEFAULT_TRANSLATION_PARAMS.items():
+                    current_value = data.get(p)
+                    data[p] = current_value if current_value is not None else default_value
+                if not TASK_DATA[task_id].get('manual', False):
+                    ONGOING_TASKS.append(task_id)
+                return web.json_response({'task_id': task_id, 'data': data})
+            else:
+                return web.json_response({})
         else:
-            reader = None
+            return web.json_response({})
+    return web.json_response({})
 
-        records = set()
-        for item in nodes:
-            if not item or not isinstance(item, dict):
-                continue
+async def manual_trans_task(task_id, texts, translations):
+    if task_id not in TASK_DATA:
+        TASK_DATA[task_id] = {}
+    if texts and translations:
+        TASK_DATA[task_id]['trans_request'] = [{'s': txt, 't': trans} for txt, trans in zip(texts, translations)]
+    else:
+        TASK_DATA[task_id]['trans_result'] = []
+        print('Manual translation complete')
 
-            server = item.get("server", "")
-            port = item.get("port", "")
-            key = f"{server}:{port}"
+@routes.post("/cancel-manual-request")
+async def cancel_manual_translation(request):
+    rqjson = (await request.json())
+    if 'task_id' in rqjson:
+        task_id = rqjson['task_id']
+        if task_id in TASK_DATA:
+            TASK_DATA[task_id]['cancel'] = ' '
+            while True:
+                await asyncio.sleep(0.1)
+                if TASK_STATES[task_id]['info'].startswith('error'):
+                    ret = web.json_response({'task_id': task_id, 'status': 'error'})
+                    break
+                if TASK_STATES[task_id]['finished']:
+                    ret = web.json_response({'task_id': task_id, 'status': 'cancelled'})
+                    break
+            del TASK_STATES[task_id]
+            del TASK_DATA[task_id]
+            return ret
+    return web.json_response({})
 
-            if key not in records:
-                records.add(key)
+@routes.post("/post-manual-result")
+async def post_translation_result(request):
+    rqjson = (await request.json())
+    if 'trans_result' in rqjson and 'task_id' in rqjson:
+        task_id = rqjson['task_id']
+        if task_id in TASK_DATA:
+            trans_result = [r['t'] for r in rqjson['trans_result']]
+            TASK_DATA[task_id]['trans_result'] = trans_result
+            while True:
+                await asyncio.sleep(0.1)
+                if TASK_STATES[task_id]['info'].startswith('error'):
+                    ret = web.json_response({'task_id': task_id, 'status': 'error'})
+                    break
+                if TASK_STATES[task_id]['finished']:
+                    ret = web.json_response({'task_id': task_id, 'status': 'successful'})
+                    break
+            # remove old tasks
+            del TASK_STATES[task_id]
+            del TASK_DATA[task_id]
+            return ret
+    return web.json_response({})
 
-                if reader:
-                    address = trim(item.get("server", ""))
-                    if not address:
-                        continue
+@routes.post("/request-manual-internal")
+async def request_translation_internal(request):
+    global NONCE
+    rqjson = await request.json()
+    if constant_compare(rqjson.get('nonce'), NONCE):
+        task_id = rqjson['task_id']
+        if task_id in TASK_DATA:
+            if TASK_DATA[task_id].get('manual', False):
+                # manual translation
+                asyncio.gather(manual_trans_task(task_id, rqjson['texts'], rqjson['translations']))
+    return web.json_response({})
 
-                    try:
-                        ip = socket.gethostbyname(address)
+@routes.post("/get-manual-result-internal")
+async def get_translation_internal(request):
+    global NONCE
+    rqjson = (await request.json())
+    if constant_compare(rqjson.get('nonce'), NONCE):
+        task_id = rqjson['task_id']
+        if task_id in TASK_DATA:
+            if 'trans_result' in TASK_DATA[task_id]:
+                return web.json_response({'result': TASK_DATA[task_id]['trans_result']})
+            elif 'cancel' in TASK_DATA[task_id]:
+                return web.json_response({'cancel':''})
+    return web.json_response({})
 
-                        # fake ip
-                        if not ip.startswith("198.18.0."):
-                            name = item.get("name", "")
-                            response = reader.country(ip)
-                            country = response.country.names.get("zh-CN", "")
+@routes.get("/task-state")
+async def get_task_state_async(request):
+    """
+    Web API for getting the state of an on-going translation task from the website.
 
-                            if country == "中国":
-                                # TODO: may be a transit node, need to further confirm landing ip address
-                                name = re.sub(r"^[\U0001F1E6-\U0001F1FF]{2}", "", name, flags=re.I)
-                            elif country:
-                                name = country
-                        else:
-                            print("cannot get geolocation and rename because IP address is faked")
+    Is periodically called from ui.html. Once it returns a finished state,
+    the web client will try to fetch the corresponding image through /result/<task_id>
+    """
+    task_id = request.query.get('taskid')
+    if task_id and task_id in TASK_STATES and task_id in TASK_DATA:
+        state = TASK_STATES[task_id]
+        data = TASK_DATA[task_id]
+        res_dict = {
+            'state': state['info'],
+            'finished': state['finished'],
+        }
+        data['requested_at'] = time.time()
+        try:
+            res_dict['waiting'] = QUEUE.index(task_id) + 1
+        except Exception:
+            res_dict['waiting'] = 0
+        res = web.json_response(res_dict)
 
-                        item["name"] = name
-                    except Exception:
-                        pass
+        return res
+    return web.json_response({'state': 'error'})
 
-                name = re.sub(r"-?(\d+|(\d+|\s+|(\d+)?-\d+)[A-Z])$", "", item.get("name", "")).strip()
-                if not name:
-                    name = "".join(random.sample(string.ascii_uppercase, 6))
+@routes.post("/task-update-internal")
+async def post_task_update_async(request):
+    """
+    Lets the translator update the task state it is working on.
+    """
+    global NONCE, ONGOING_TASKS, FINISHED_TASKS
+    rqjson = (await request.json())
+    if constant_compare(rqjson.get('nonce'), NONCE):
+        task_id = rqjson['task_id']
+        if task_id in TASK_STATES and task_id in TASK_DATA:
+            TASK_STATES[task_id] = {
+                'info': rqjson['state'],
+                'finished': rqjson['finished'],
+            }
+            if rqjson['finished'] and not TASK_DATA[task_id].get('manual', False):
+                try:
+                    i = ONGOING_TASKS.index(task_id)
+                    FINISHED_TASKS.append(ONGOING_TASKS.pop(i))
+                except ValueError:
+                    pass
+            print(f'Task state {task_id} to {TASK_STATES[task_id]}')
+    return web.json_response({})
 
-                item["name"] = name
+@routes.post("/submit")
+async def submit_async(request):
+    """Adds new task to the queue. Called by web client in ui.html when submitting an image."""
+    global FORMAT
+    x = await handle_post(request)
+    if isinstance(x, tuple):
+        img, size, selected_translator, target_language, detector, direction = x
+    else:
+        return x
+    timestamp = str(int(time.time() * 1000))  # 使用时间戳
+    task_id = f'{size}-{selected_translator}-{target_language}-{detector}-{direction}-{timestamp}-{phash(img, hash_size = 16)}'
+    now = time.time()
+    print(f'New `submit` task {task_id}')
+    if os.path.exists(f'result/{task_id}/final.{FORMAT}'):
+        TASK_STATES[task_id] = {
+            'info': 'saved',
+            'finished': True,
+        }
+        TASK_DATA[task_id] = {
+            'detection_size': size,
+            'translator': selected_translator,
+            'target_lang': target_language,
+            'detector': detector,
+            'direction': direction,
+            'created_at': now,
+            'requested_at': now,
+        }
+    elif task_id not in TASK_DATA or task_id not in TASK_STATES:
+        os.makedirs(f'result/{task_id}/', exist_ok=True)
+        img.save(f'result/{task_id}/input.png')
+        QUEUE.append(task_id)
+        TASK_STATES[task_id] = {
+            'info': 'pending',
+            'finished': False,
+        }
+        TASK_DATA[task_id] = {
+            'detection_size': size,
+            'translator': selected_translator,
+            'target_lang': target_language,
+            'detector': detector,
+            'direction': direction,
+            'created_at': now,
+            'requested_at': now,
+        }
+    return web.json_response({'task_id': task_id, 'status': 'successful'})
 
-                if args.secure:
-                    if "tls" in item:
-                        item["tls"] = True
-                    if "skip-cert-verify" in item:
-                        item["skip-cert-verify"] = False
+@routes.post("/manual-translate")
+async def manual_translate_async(request):
+    x = await handle_post(request)
+    if isinstance(x, tuple):
+        img, size, selected_translator, target_language, detector, direction = x
+    else:
+        return x
+    task_id = secrets.token_hex(16)
+    print(f'New `manual-translate` task {task_id}')
+    os.makedirs(f'result/{task_id}/', exist_ok=True)
+    img.save(f'result/{task_id}/input.png')
+    now = time.time()
+    QUEUE.append(task_id)
+    # TODO: Add form fields to manual translate website
+    TASK_DATA[task_id] = {
+        # 'detection_size': size,
+        'manual': True,
+        # 'detector': detector,
+        # 'direction': direction,
+        'created_at': now,
+        'requested_at': now,
+    }
+    print(TASK_DATA[task_id])
+    TASK_STATES[task_id] = {
+        'info': 'pending',
+        'finished': False,
+    }
+    while True:
+        await asyncio.sleep(1)
+        if 'trans_request' in TASK_DATA[task_id]:
+            return web.json_response({'task_id' : task_id, 'status': 'pending', 'trans_result': TASK_DATA[task_id]['trans_request']})
+        if TASK_STATES[task_id]['info'].startswith('error'):
+            break
+        if TASK_STATES[task_id]['finished']:
+            # no texts detected
+            return web.json_response({'task_id' : task_id, 'status': 'successful'})
+    return web.json_response({'task_id' : task_id, 'status': 'error'})
 
-                caches[name].append(item)
-
-    proxies = list()
-    for name, nodes in caches.items():
-        n = max(args.num, math.floor(math.log10(len(nodes))) + 1)
-
-        for index, node in enumerate(nodes):
-            node["name"] = f"{name} {str(index+1).zfill(n)}"
-            proxies.append(node)
-
-    if not proxies:
-        print(f"no proxies found in file {filepath}")
-        return
-
-    data = {"proxies": proxies}
-    if args.backup:
-        copy(filepath)
-    with open(filepath, "w+", encoding="utf8") as f:
-        yaml.dump(data, f, allow_unicode=True)
-
-    print(f"process finished, file has been saved to {filepath}")
+app.add_routes(routes)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def generate_nonce():
+    return secrets.token_hex(16)
 
-    parser.add_argument(
-        "-b",
-        "--backup",
-        dest="backup",
-        action="store_true",
-        default=False,
-        help="Backup old provider file",
-    )
+def start_translator_client_proc(host: str, port: int, nonce: str, params: dict):
+    os.environ['MT_WEB_NONCE'] = nonce
+    cmds = [
+        sys.executable,
+        '-m', 'manga_translator',
+        '--mode', 'web_client',
+        '--host', host,
+        '--port', str(port),
+    ]
+    if params.get('use_gpu', False):
+        cmds.append('--use-gpu')
+    if params.get('use_gpu_limited', False):
+        cmds.append('--use-gpu-limited')
+    if params.get('ignore_errors', False):
+        cmds.append('--ignore-errors')
+    if params.get('verbose', False):
+        cmds.append('--verbose')
 
-    parser.add_argument(
-        "-c",
-        "--config",
-        type=str,
-        default="config.yaml",
-        required=False,
-        help="Clash configuration filename",
-    )
+    proc = subprocess.Popen(cmds, cwd=BASE_PATH)
+    return proc
 
-    parser.add_argument(
-        "-l",
-        "--location",
-        dest="location",
-        action="store_true",
-        default=False,
-        help="Modify proxy name to country corresponding to the IP or domain",
-    )
+async def start_async_app(host: str, port: int, nonce: str, translation_params: dict = None):
+    global NONCE, DEFAULT_TRANSLATION_PARAMS, FORMAT
+    # Secret to secure communication between webserver and translator clients
+    NONCE = nonce
+    DEFAULT_TRANSLATION_PARAMS = translation_params or {}
+    FORMAT = DEFAULT_TRANSLATION_PARAMS.get('format') or 'jpg'
+    DEFAULT_TRANSLATION_PARAMS['format'] = FORMAT
 
-    parser.add_argument(
-        "-n",
-        "--num",
-        type=int,
-        required=False,
-        default=2,
-        help="Number of digits to fill",
-    )
+    # Schedule web server to run
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    print(f'Serving up app on http://{host}:{port}')
 
-    parser.add_argument(
-        "-s",
-        "--secure",
-        dest="secure",
-        action="store_true",
-        default=False,
-        help="Enforce TLS and reject skipping certificate validation",
-    )
+    return runner, site
 
-    parser.add_argument(
-        "-u",
-        "--update",
-        dest="update",
-        action="store_true",
-        default=False,
-        help="force update geoip database",
-    )
+async def dispatch(host: str, port: int, nonce: str = None, translation_params: dict = None):
+    """
+    启动 aiohttp Web 服务器，并在同一进程内用协程并发翻译任务。
+    """
+    global ONGOING_TASKS, FINISHED_TASKS
 
-    parser.add_argument(
-        "-w",
-        "--workspace",
-        type=str,
-        default=PATH,
-        required=False,
-        help="workspace absolute path",
-    )
+    if nonce is None:
+        nonce = os.getenv('MT_WEB_NONCE', generate_nonce())
 
-    main(parser.parse_args())
+    # 开启 Web 服务
+    runner, site = await start_async_app(host, port, nonce, translation_params)
+
+    # --- ① 仅加载一次模型 ---
+    translator = MangaTranslator(translation_params or {})
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def progress_hook(state, finished):
+        if tid := getattr(asyncio.current_task(), "tid", None):
+            TASK_STATES[tid]['info'] = state
+            TASK_STATES[tid]['finished'] = finished
+
+    translator.add_progress_hook(progress_hook)
+
+    async def worker():
+        while True:
+            # 等待任务
+            task_id = await asyncio.get_running_loop().run_in_executor(None, QUEUE.popleft)
+            asyncio.current_task().tid = task_id
+            async with sem:
+                try:
+                    inp = os.path.join('result', task_id, 'input.png')
+                    out = os.path.join('result', task_id, f'final.{FORMAT}')
+                    params = TASK_DATA[task_id]
+                    TASK_STATES[task_id]['info'] = 'detection'
+                    await translator.translate_path(inp, out, params)
+                except Exception as e:
+                    TASK_STATES[task_id]['info'] = 'error'
+                    TASK_STATES[task_id]['finished'] = True
+                    print(f"[{task_id}] translate failed:", e)
+                else:
+                    TASK_STATES[task_id]['info'] = 'saved'
+                    TASK_STATES[task_id]['finished'] = True
+
+    # 启动 N 个协程 worker
+    workers = [asyncio.create_task(worker()) for _ in range(CONCURRENCY)]
+
+    # ---------- 与原版一致的回收 / 清理循环 ----------
+    try:
+        os.makedirs('result/', exist_ok=True)
+        for f in os.listdir('result/'):
+            if os.path.isdir(f'result/{f}') and re.search(r'^\w+-\d+-\w+-\w+-\w+-\w+$', f):
+                FINISHED_TASKS.append(f)
+        FINISHED_TASKS.sort(key=lambda tid: os.path.getmtime(f'result/{tid}'))
+
+        while True:
+            await asyncio.sleep(1)
+
+            # 过期任务 & 磁盘清理（原逻辑）
+            now = time.time()
+            del_ids = [tid for tid, s in TASK_STATES.items()
+                       if s['finished'] and now - TASK_DATA[tid]['created_at'] > FINISHED_TASK_REMOVE_TIMEOUT]
+            for tid in del_ids:
+                TASK_STATES.pop(tid, None)
+                TASK_DATA.pop(tid, None)
+
+            if DISK_SPACE_LIMIT >= 0 and FINISHED_TASKS and shutil.disk_usage('result/')[2] < DISK_SPACE_LIMIT:
+                tid = FINISHED_TASKS.pop(0)
+                try:
+                    shutil.rmtree(f'result/{tid}')
+                except FileNotFoundError:
+                    pass
+    finally:
+        for w in workers:
+            w.cancel()
+        await runner.cleanup()
+### ----------------------  end patch  ----------------------
+
+if __name__ == '__main__':
+    from ..args import parser
+
+    args = parser.parse_args()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        runner, site = loop.run_until_complete(dispatch(args.host, args.port, translation_params=vars(args)))
+    except KeyboardInterrupt:
+        pass
