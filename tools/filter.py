@@ -1,3 +1,39 @@
+import os
+import cv2
+import numpy as np
+from typing import List
+from shapely import affinity
+from shapely.geometry import Polygon
+from tqdm import tqdm
+
+# from .ballon_extractor import extract_ballon_region
+from . import text_render
+from .text_render_eng import render_textblock_list_eng
+from ..utils import (
+    BASE_PATH,
+    TextBlock,
+    color_difference,
+    get_logger,
+    rotate_polygons,
+)
+from ..config import Config
+
+logger = get_logger('render')
+
+def parse_font_paths(path: str, default: List[str] = None) -> List[str]:
+    if path:
+        parsed = path.split(',')
+        parsed = list(filter(lambda p: os.path.isfile(p), parsed))
+    else:
+        parsed = default or []
+    return parsed
+
+def fg_bg_compare(fg, bg):
+    fg_avg = np.mean(fg)
+    if color_difference(fg, bg) < 30:
+        bg = (255, 255, 255) if fg_avg <= 127 else (0, 0, 0)
+    return fg, bg
+
 def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int):  
     """  
     调整文本区域大小以适应字体大小和翻译文本长度。  
@@ -125,3 +161,215 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         region.font_size = int(target_font_size) # 将 TextBlock 的字体大小更新为计算出的目标字体大小  
 
     return dst_points_list  
+
+async def dispatch(
+    img: np.ndarray,
+    text_regions: List[TextBlock],
+    font_path: str = '',
+    font_size_fixed: int = None,
+    font_size_offset: int = 0,
+    font_size_minimum: int = 0,
+    hyphenate: bool = True,
+    render_mask: np.ndarray = None,
+    line_spacing: int = None,
+    disable_font_border: bool = False,
+    config: Config = None
+    ) -> np.ndarray:
+
+    text_render.set_font(font_path)
+    text_regions = list(filter(lambda region: region.translation, text_regions))
+
+    # Resize regions that are too small
+    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+
+    # TODO: Maybe remove intersections
+
+    # Render text
+    for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
+        if render_mask is not None:
+            # set render_mask to 1 for the region that is inside dst_points
+            cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
+        img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border, config)
+    return img
+
+def render(
+    img,
+    region: TextBlock,
+    dst_points,
+    hyphenate,
+    line_spacing,
+    disable_font_border,
+    config: Config
+):
+    fg, bg = region.get_font_colors()
+    fg, bg = fg_bg_compare(fg, bg)
+    if disable_font_border:
+        bg = None
+
+    middle_pts = (dst_points[:, [1, 2, 3, 0]] + dst_points) / 2
+    norm_h = np.linalg.norm(middle_pts[:, 1] - middle_pts[:, 3], axis=1)
+    norm_v = np.linalg.norm(middle_pts[:, 2] - middle_pts[:, 0], axis=1)
+    r_orig = np.mean(norm_h / norm_v)
+
+    # 如果配置中设定了非自动模式，则直接使用配置决定方向
+    forced_direction = region._direction if hasattr(region, "_direction") else region.direction
+    if forced_direction != "auto":
+        if forced_direction in ["horizontal", "h"]:
+            render_horizontally = True
+        elif forced_direction in ["vertical", "v"]:
+            render_horizontally = False
+        else:
+            render_horizontally = region.horizontal
+    else:
+        render_horizontally = region.horizontal
+
+    if render_horizontally:
+        temp_box = text_render.put_text_horizontal(
+            region.font_size,
+            region.get_translation_for_rendering(),
+            round(norm_h[0]),
+            round(norm_v[0]),
+            region.alignment,
+            region.direction == 'hl',  # 强制水平排版
+            fg,
+            bg,
+            region.target_lang,
+            hyphenate,
+            line_spacing,
+        )
+    else:
+        temp_box = text_render.put_text_vertical(
+            region.font_size,
+            region.get_translation_for_rendering(),
+            round(norm_v[0]),
+            region.alignment,
+            fg,
+            bg,
+            line_spacing,
+            config
+        )
+    h, w, _ = temp_box.shape
+    r_temp = w / h
+
+    # # Extend temporary box so that it has same ratio as original
+    # if r_temp > r_orig:
+        # h_ext = int(w / (2 * r_orig) - h / 2)
+        # box = np.zeros((h + h_ext * 2, w, 4), dtype=np.uint8)
+        # box[h_ext:h + h_ext, 0:w] = temp_box
+    # else:
+        # w_ext = int((h * r_orig - w) / 2)
+        # box = np.zeros((h, w + w_ext * 2, 4), dtype=np.uint8)
+        # box[0:h, w_ext:w_ext+w] = temp_box
+
+    # --- Start Modification ---
+    box = None  
+    #print("\n" + "="*50)  
+    #print(f"Processing text: \"{region.get_translation_for_rendering()}\"")  
+    #print(f"Text direction: {'Horizontal' if region.horizontal else 'Vertical'}")  
+    #print(f"Font size: {region.font_size}, Alignment: {region.alignment}")  
+    #print(f"Target language: {region.target_lang}")      
+    #print(f"Region horizontal: {region.horizontal}")  
+    #print(f"Starting image adjustment: r_temp={r_temp}, r_orig={r_orig}, h={h}, w={w}")  
+    if region.horizontal:  
+        #print("Processing HORIZONTAL region")  
+        
+        if r_temp > r_orig:   
+            #print(f"Case: r_temp({r_temp}) > r_orig({r_orig}) - Need vertical padding")  
+            h_ext = int((w / r_orig - h) // 2) if r_orig > 0 else 0  
+            #print(f"Calculated h_ext = {h_ext}")  
+            
+            if h_ext >= 0:  
+                #print(f"Creating new box with dimensions: {h + h_ext * 2}x{w}")  
+                box = np.zeros((h + h_ext * 2, w, 4), dtype=np.uint8)  
+                #print(f"Placing temp_box at position [h_ext:h_ext+h, :w] = [{h_ext}:{h_ext+h}, 0:{w}]")  
+                # 列已排满，行居中
+                box[h_ext:h_ext+h, 0:w] = temp_box  
+            else:  
+                #print("h_ext < 0, using original temp_box")  
+                box = temp_box.copy()  
+        else:   
+            #print(f"Case: r_temp({r_temp}) <= r_orig({r_orig}) - Need horizontal padding")  
+            w_ext = int((h * r_orig - w) // 2)  
+            #print(f"Calculated w_ext = {w_ext}")  
+            
+            if w_ext >= 0:  
+                #print(f"Creating new box with dimensions: {h}x{w + w_ext * 2}")  
+                box = np.zeros((h, w + w_ext * 2, 4), dtype=np.uint8)  
+                #print(f"Placing temp_box at position [:, :w] = [0:{h}, 0:{w}]")  
+                # 当前气泡检测的问题：
+                # 1.对纯色背景的误判（核心问题）：
+                # 原因：代码计算文本框边缘2像素区域的黑/白像素比例。如果文本框在一个大的纯白背景上（比如白纸黑字），边缘绝大部分是白色，ratio会很低（接近0），低于ignore_bubble阈值。代码会认为这是一个“正常的白色气泡背景”，从而错误地不忽略它（即，认为它是需要翻译的普通气泡内文字）。虽然这些文字确实要翻译，但是它们并不是气泡内文字。
+                # 根本缺陷：这种方法没有检测气泡的边界/轮廓，只是在检查局部背景色。
+                # 2.无法识别气泡边界：
+                # 原因：代码不涉及任何形状或轮廓检测。它不知道是否存在一个封闭的、颜色相对均匀的线条包围着文本框。
+                # 后果：无法区分真正的气泡（有边界）和仅仅是背景颜色恰好符合比例的情况。
+                # 3.对气泡大小和相对位置不敏感：
+                # 原因：只看紧邻的2像素，不考虑气泡整体的大小、形状，以及文本框在气泡内的相对位置。
+                # 后果：无法利用“气泡通常会包围文本框，且大小适中。”这一常识性特征。
+                # 4.连通气泡问题：
+                # 原因：当前逻辑完全基于单个文本框的局部环境，无法感知是否存在一个跨越多个文本框的共享气泡结构。
+                # 后果：无法处理一个大或形状复杂的气泡包含多个独立文本块的情况，也无法判断哪个文本块对应气泡的哪一部分。
+            
+                # 行已排满，文字左侧不留空列，否则当存在多个文本框的左边线处于一条线上时译后文本无法对齐。常见场景：无框漫画、漫画后记
+                # 当前页面存在气泡时则可改为居中：box[0:h, w_ext:w_ext+w] = temp_box，需更准确的气泡检测。              
+                box[0:h, 0:w] = temp_box  
+            else:  
+                #print("w_ext < 0, using original temp_box")  
+                box = temp_box.copy()  
+    else:  
+        #print("Processing VERTICAL region")  
+        
+        if r_temp > r_orig:   
+            #print(f"Case: r_temp({r_temp}) > r_orig({r_orig}) - Need vertical padding")  
+            h_ext = int(w / (2 * r_orig) - h / 2) if r_orig > 0 else 0   
+            #print(f"Calculated h_ext = {h_ext}")  
+            
+            if h_ext >= 0:   
+                #print(f"Creating new box with dimensions: {h + h_ext * 2}x{w}")  
+                box = np.zeros((h + h_ext * 2, w, 4), dtype=np.uint8)  
+                #print(f"Placing temp_box at position [0:h, 0:w] = [0:{h}, 0:{w}]")  
+                # 列已排满，文字的上方不留空行，否则当存在多个文本框的上边线在一条线上时文本无法对齐，常见场景：无框漫画、CG
+                # 当前页面存在气泡时则可改为居中：box[h_ext:h_ext+h, 0:w] = temp_box，需更准确的气泡检测。
+                box[0:h, 0:w] = temp_box  
+            else:   
+                #print("h_ext < 0, using original temp_box")  
+                box = temp_box.copy()   
+        else:   
+            #print(f"Case: r_temp({r_temp}) <= r_orig({r_orig}) - Need horizontal padding")  
+            w_ext = int((h * r_orig - w) / 2)  
+            #print(f"Calculated w_ext = {w_ext}")  
+            
+            if w_ext >= 0:  
+                #print(f"Creating new box with dimensions: {h}x{w + w_ext * 2}")  
+                box = np.zeros((h, w + w_ext * 2, 4), dtype=np.uint8)  
+                #print(f"Placing temp_box at position [0:h, w_ext:w_ext+w] = [0:{h}, {w_ext}:{w_ext+w}]") 
+                # 行已排满，列居中                
+                box[0:h, w_ext:w_ext+w] = temp_box  
+            else:   
+                #print("w_ext < 0, using original temp_box")  
+                box = temp_box.copy()   
+
+    #print(f"Final box dimensions: {box.shape if box is not None else 'None'}")  
+
+    src_points = np.array([[0, 0], [box.shape[1], 0], [box.shape[1], box.shape[0]], [0, box.shape[0]]]).astype(np.float32)
+    M, _ = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0)
+    rgba_region = cv2.warpPerspective(box, M, (img.shape[1], img.shape[0]),
+                                      flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_CONSTANT,
+                                      borderValue=0)
+    x, y, w, h = cv2.boundingRect(dst_points.astype(np.int32))
+    canvas_region = rgba_region[y:y+h, x:x+w, :3]
+    mask_region = rgba_region[y:y+h, x:x+w, 3:4].astype(np.float32) / 255.0
+    img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) +
+                                 canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
+    return img
+
+async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
+    if len(text_regions) == 0:
+        return img_canvas
+
+    if not font_path:
+        font_path = os.path.join(BASE_PATH, 'fonts/comic shanns 2.ttf')
+    text_render.set_font(font_path)
+
+    return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8,disable_font_border=disable_font_border)
